@@ -1,5 +1,5 @@
 //========================================================================
-// GLFW 3.5 macOS - www.glfw.org
+// GLFW 3.5 Cocoa - www.glfw.org
 //------------------------------------------------------------------------
 // Copyright (c) 2002-2006 Marcus Geelnard
 // Copyright (c) 2006-2019 Camilla Löwy <elmindreda@glfw.org>
@@ -314,6 +314,7 @@ void _glfwPollMonitorsCocoa(void)
                _glfw.monitorCount * sizeof(_GLFWmonitor*));
     }
 
+    NSArray* screens = [NSScreen screens];
     for (uint32_t i = 0;  i < displayCount;  i++)
     {
         if (CGDisplayIsAsleep(displays[i]))
@@ -322,7 +323,7 @@ void _glfwPollMonitorsCocoa(void)
         const uint32_t unitNumber = CGDisplayUnitNumber(displays[i]);
         NSScreen* screen = nil;
 
-        for (screen in [NSScreen screens])
+        for (screen in screens)
         {
             NSNumber* screenNumber = [screen deviceDescription][@"NSScreenNumber"];
 
@@ -332,6 +333,9 @@ void _glfwPollMonitorsCocoa(void)
             if (CGDisplayUnitNumber([screenNumber unsignedIntValue]) == unitNumber)
                 break;
         }
+        // fallback: when displays are in mirroring mode, only one NSScreen exists
+        if(screen == nil)
+            screen = [[NSScreen screens] firstObject];
 
         // HACK: Compare unit numbers instead of display IDs to work around
         //       display replacement on machines with automatic graphics
