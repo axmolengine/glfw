@@ -434,6 +434,13 @@ typedef struct _GLFWwindowWayland
         uint32_t                    buttonPressSerial;
         const char*                 cursorName;
     } fallback;
+
+    struct zwp_text_input_v1* textInputV1;
+    struct zwp_text_input_v3* textInputV3;
+    struct {
+        char* preeditText;
+        char* commitTextOnReset;
+    } textInputV1Context;
 } _GLFWwindowWayland;
 
 // Wayland-specific global data
@@ -458,6 +465,8 @@ typedef struct _GLFWlibraryWayland
     struct zwp_idle_inhibit_manager_v1*     idleInhibitManager;
     struct xdg_activation_v1*               activationManager;
     struct wp_fractional_scale_manager_v1*  fractionalScaleManager;
+    struct zwp_text_input_manager_v1*       textInputManagerV1;
+    struct zwp_text_input_manager_v3*       textInputManagerV3;
 
     _GLFWofferWayland*          offers;
     unsigned int                offerCount;
@@ -706,6 +715,11 @@ void _glfwDestroyCursorWayland(_GLFWcursor* cursor);
 void _glfwSetCursorWayland(_GLFWwindow* window, _GLFWcursor* cursor);
 void _glfwSetClipboardStringWayland(const char* string);
 const char* _glfwGetClipboardStringWayland(void);
+
+void _glfwUpdatePreeditCursorRectangleWayland(_GLFWwindow* window);
+void _glfwResetPreeditTextWayland(_GLFWwindow* window);
+void _glfwSetIMEStatusWayland(_GLFWwindow* window, int enabled);
+int _glfwGetIMEStatusWayland(_GLFWwindow* window);
 
 EGLenum _glfwGetEGLPlatformWayland(EGLint** attribs);
 EGLNativeDisplayType _glfwGetEGLNativeDisplayWayland(void);

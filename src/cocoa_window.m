@@ -208,17 +208,17 @@ static const NSRange kEmptyRange = { NSNotFound, 0 };
     _GLFWwindow* window;
 }
 
-- (instancetype)initWithGlfwWindow:(_GLFWwindow *)initWindow;
+- (instancetype)initWithGlfwWindow:(_GLFWwindow *)ownerWindow;
 
 @end
 
 @implementation GLFWWindowDelegate
 
-- (instancetype)initWithGlfwWindow:(_GLFWwindow *)initWindow
+- (instancetype)initWithGlfwWindow:(_GLFWwindow *)ownerWindow
 {
     self = [super init];
     if (self != nil)
-        window = initWindow;
+        window = ownerWindow;
 
     return self;
 }
@@ -321,6 +321,11 @@ static const NSRange kEmptyRange = { NSNotFound, 0 };
     }
 }
 
+- (void)imeStatusChangeNotified:(NSNotification *)notification
+{
+    _glfwInputIMEStatus(window);
+}
+
 @end
 
 
@@ -333,20 +338,28 @@ static const NSRange kEmptyRange = { NSNotFound, 0 };
     _GLFWwindow* window;
     NSTrackingArea* trackingArea;
     NSMutableAttributedString* markedText;
+    BOOL _handlingKeyDown;
+    BOOL _composing;
+
+    int _cachedMods;
 }
 
-- (instancetype)initWithGlfwWindow:(_GLFWwindow *)initWindow;
+- (instancetype)initWithGlfwWindow:(_GLFWwindow *)ownerWindow;
 
 @end
 
 @implementation GLFWContentView
 
-- (instancetype)initWithGlfwWindow:(_GLFWwindow *)initWindow
+- (instancetype)initWithGlfwWindow:(_GLFWwindow *)ownerWindow
 {
     self = [super init];
     if (self != nil)
     {
-        window = initWindow;
+        _handlingKeyDown = NO;
+        _composing = NO;
+        _cachedMods = 0;
+        
+        window = ownerWindow;
         trackingArea = nil;
         markedText = [[NSMutableAttributedString alloc] init];
 
@@ -565,9 +578,51 @@ static const NSRange kEmptyRange = { NSNotFound, 0 };
     const int key = translateKey([event keyCode]);
     const int mods = translateFlags([event modifierFlags]);
 
-    _glfwInputKey(window, key, [event keyCode], GLFW_PRESS, mods);
+    _cachedMods = mods;
 
-    [self interpretKeyEvents:@[event]];
+    //
+    // Remember whether composition was already active
+    // before this key event.
+    //
+    // This avoids suppressing the very first key
+    // that starts IME composition.
+    //
+
+    const BOOL composingBefore = _composing;
+
+    if (window->imeEnabled)
+    {
+        _handlingKeyDown = YES;
+
+        [self interpretKeyEvents:@[ event ]];
+
+        _handlingKeyDown = NO;
+    }
+
+    //
+    // Suppress printable raw keys only while
+    // an IME composition is already active.
+    //
+    // Keep:
+    //   arrows
+    //   escape
+    //   enter
+    //   function keys
+    //   modifiers
+    //
+
+    const BOOL printable =
+        key >= GLFW_KEY_SPACE &&
+        key <= GLFW_KEY_WORLD_2;
+
+    if (!(composingBefore && printable))
+    {
+        _glfwInputKey(window,
+                      key,
+                      [event keyCode],
+                      GLFW_PRESS,
+                      mods);
+    }
 }
 
 - (void)flagsChanged:(NSEvent *)event
@@ -652,36 +707,147 @@ static const NSRange kEmptyRange = { NSNotFound, 0 };
 
 - (BOOL)hasMarkedText
 {
-    return [markedText length] > 0;
+    return _composing;
 }
 
 - (NSRange)markedRange
 {
-    if ([markedText length] > 0)
-        return NSMakeRange(0, [markedText length] - 1);
-    else
-        return kEmptyRange;
+    if (_composing)
+        return NSMakeRange(0, [markedText length]);
+
+    return NSMakeRange(NSNotFound, 0);
 }
 
 - (NSRange)selectedRange
 {
-    return kEmptyRange;
+    return NSMakeRange(NSNotFound, 0);
+}
+
+- (void)setImeEnabled:(int)enabled
+{
+    window->imeEnabled = enabled;
+
+    NSTextInputContext* inputContext = [self inputContext];
+    if (!inputContext)
+        return;
+
+    if (enabled)
+    {
+        [inputContext activate];
+    }
+    else
+    {
+        [inputContext discardMarkedText];
+        [inputContext deactivate];
+
+        [self unmarkText];
+    }
 }
 
 - (void)setMarkedText:(id)string
         selectedRange:(NSRange)selectedRange
      replacementRange:(NSRange)replacementRange
 {
+    _composing = YES;
+    
     [markedText release];
     if ([string isKindOfClass:[NSAttributedString class]])
         markedText = [[NSMutableAttributedString alloc] initWithAttributedString:string];
     else
         markedText = [[NSMutableAttributedString alloc] initWithString:string];
+
+    NSString* markedTextString = markedText.string;
+
+    NSUInteger textLen = [markedTextString length];
+    _GLFWpreedit* preedit = &window->preedit;
+    int textBufferCount = preedit->textBufferCount;
+    while (textBufferCount < textLen + 1)
+        textBufferCount = textBufferCount == 0 ? 1 : textBufferCount * 2;
+    if (textBufferCount != preedit->textBufferCount)
+    {
+        unsigned int* preeditText = _glfw_realloc(preedit->text,
+                                                  sizeof(unsigned int) * textBufferCount);
+        if (preeditText == NULL)
+            return;
+        preedit->text = preeditText;
+        preedit->textBufferCount = textBufferCount;
+    }
+
+    // NSString handles text data in UTF16 by default, so we have to convert them
+    // to UTF32. Not only the encoding, but also the number of characters and
+    // the position of each block.
+    int currentBlockIndex = 0;
+    int currentBlockLength = 0;
+    int currentBlockLocation = 0;
+    int focusedBlockIndex = 0;
+    NSInteger preeditTextLength = 0;
+    NSRange range = NSMakeRange(0, textLen);
+    while (range.length)
+    {
+        uint32_t codepoint = 0;
+        NSRange currentBlockRange;
+        [markedText attributesAtIndex:range.location
+                       effectiveRange:&currentBlockRange];
+
+        if (preedit->blockSizesBufferCount < 1 + currentBlockIndex)
+        {
+            int blockBufferCount = (preedit->blockSizesBufferCount == 0)
+                ? 1 : preedit->blockSizesBufferCount * 2;
+            int* blocks = _glfw_realloc(preedit->blockSizes,
+                                        sizeof(int) * blockBufferCount);
+            if (blocks == NULL)
+                return;
+            preedit->blockSizes = blocks;
+            preedit->blockSizesBufferCount = blockBufferCount;
+        }
+
+        if (currentBlockLocation != currentBlockRange.location)
+        {
+            currentBlockLocation = currentBlockRange.location;
+            preedit->blockSizes[currentBlockIndex++] = currentBlockLength;
+            currentBlockLength = 0;
+            if (selectedRange.location == currentBlockRange.location)
+                focusedBlockIndex = currentBlockIndex;
+        }
+
+        if ([markedTextString getBytes:&codepoint
+                             maxLength:sizeof(codepoint)
+                            usedLength:NULL
+                              encoding:NSUTF32StringEncoding
+                               options:0
+                                 range:range
+                        remainingRange:&range])
+        {
+            if (codepoint >= 0xf700 && codepoint <= 0xf7ff)
+                continue;
+
+            preedit->text[preeditTextLength++] = codepoint;
+            currentBlockLength++;
+        }
+    }
+    preedit->blockSizes[currentBlockIndex] = currentBlockLength;
+    preedit->blockSizesCount = 1 + currentBlockIndex;
+    preedit->textCount = preeditTextLength;
+    preedit->text[preeditTextLength] = 0;
+    preedit->focusedBlockIndex = focusedBlockIndex;
+    // The caret is always at the last of preedit in macOS.
+    preedit->caretIndex = preeditTextLength;
+
+    _glfwInputPreedit(window);
 }
 
 - (void)unmarkText
 {
+    _composing = NO;
+
     [[markedText mutableString] setString:@""];
+
+    window->preedit.blockSizesCount = 0;
+    window->preedit.textCount = 0;
+    window->preedit.focusedBlockIndex = 0;
+    window->preedit.caretIndex = 0;
+
+    _glfwInputPreedit(window);
 }
 
 - (NSArray*)validAttributesForMarkedText
@@ -703,23 +869,55 @@ static const NSRange kEmptyRange = { NSNotFound, 0 };
 - (NSRect)firstRectForCharacterRange:(NSRange)range
                          actualRange:(NSRangePointer)actualRange
 {
-    const NSRect frame = [window->ns.view frame];
-    return NSMakeRect(frame.origin.x, frame.origin.y, 0.0, 0.0);
+    int x = window->preedit.cursorPosX;
+    int y = window->preedit.cursorPosY;
+    int w = window->preedit.cursorWidth;
+    int h = window->preedit.cursorHeight;
+
+    NSRect rect = NSMakeRect(x, y, w, h);
+
+    //
+    // GLFW uses top-left origin.
+    // Cocoa uses bottom-left origin.
+    //
+
+    rect.origin.y =
+        self.bounds.size.height - rect.origin.y - h;
+
+    //
+    // View -> Window
+    //
+
+    rect = [self convertRect:rect toView:nil];
+
+    //
+    // Window -> Screen
+    //
+
+    rect = [[self window] convertRectToScreen:rect];
+
+    return rect;
 }
 
 - (void)insertText:(id)string replacementRange:(NSRange)replacementRange
 {
     NSString* characters;
-    NSEvent* event = [NSApp currentEvent];
-    const int mods = translateFlags([event modifierFlags]);
-    const int plain = !(mods & GLFW_MOD_SUPER);
 
     if ([string isKindOfClass:[NSAttributedString class]])
         characters = [string string];
     else
-        characters = (NSString*) string;
+        characters = (NSString*)string;
+
+    //
+    // currentEvent is unreliable during IME commit.
+    //
+
+    const int mods = _cachedMods;
+
+    const int plain = !(mods & (GLFW_MOD_SUPER | GLFW_MOD_CONTROL));
 
     NSRange range = NSMakeRange(0, [characters length]);
+
     while (range.length)
     {
         uint32_t codepoint = 0;
@@ -732,16 +930,36 @@ static const NSRange kEmptyRange = { NSNotFound, 0 };
                            range:range
                   remainingRange:&range])
         {
+            //
+            // Ignore Cocoa private-use function keys
+            //
             if (codepoint >= 0xf700 && codepoint <= 0xf7ff)
                 continue;
 
             _glfwInputChar(window, codepoint, mods, plain);
         }
     }
+
+    //
+    // IMPORTANT:
+    // Do NOT call unmarkText here.
+    //
 }
 
 - (void)doCommandBySelector:(SEL)selector
 {
+    //
+    // Prevent Cocoa beep.
+    //
+    // interpretKeyEvents may dispatch:
+    //
+    //   moveLeft:
+    //   moveRight:
+    //   deleteBackward:
+    //   insertNewline:
+    //
+    // etc.
+    //
 }
 
 @end
@@ -836,7 +1054,8 @@ static GLFWbool createNativeWindow(_GLFWwindow* window,
     }
 
     if (window->monitor)
-        [window->ns.object setLevel:NSMainMenuWindowLevel + 1];
+        [NSApp setPresentationOptions:NSApplicationPresentationHideDock |
+                                      NSApplicationPresentationHideMenuBar];
     else
     {
         if (wndconfig->xpos == GLFW_ANY_POSITION ||
@@ -982,6 +1201,12 @@ GLFWbool _glfwCreateWindowCocoa(_GLFWwindow* window,
         }
     }
 
+    [[NSNotificationCenter defaultCenter]
+        addObserver:window->ns.delegate
+           selector:@selector(imeStatusChangeNotified:)
+               name:NSTextInputContextKeyboardSelectionDidChangeNotification
+             object:nil];
+
     return GLFW_TRUE;
 
     } // autoreleasepool
@@ -993,6 +1218,8 @@ void _glfwDestroyWindowCocoa(_GLFWwindow* window)
 
     if (_glfw.ns.disabledCursorWindow == window)
         _glfw.ns.disabledCursorWindow = NULL;
+
+    [[NSNotificationCenter defaultCenter] removeObserver:window->ns.delegate];
 
     [window->ns.object orderOut:nil];
 
@@ -1306,7 +1533,8 @@ void _glfwSetWindowMonitorCocoa(_GLFWwindow* window,
 
     if (window->monitor)
     {
-        [window->ns.object setLevel:NSMainMenuWindowLevel + 1];
+        [NSApp setPresentationOptions:NSApplicationPresentationHideDock |
+                                      NSApplicationPresentationHideMenuBar];
         [window->ns.object setHasShadow:NO];
 
         acquireMonitor(window);
@@ -1358,6 +1586,9 @@ void _glfwSetWindowMonitorCocoa(_GLFWwindow* window,
                 NSWindowCollectionBehaviorFullScreenNone;
             [window->ns.object setCollectionBehavior:behavior];
         }
+        
+        // Make sure ime display correctn in fullscreen mode
+        [NSApp setPresentationOptions:NSApplicationPresentationDefault];
 
         [window->ns.object setHasShadow:YES];
         // HACK: Clearing NSWindowStyleMaskTitled resets and disables the window
@@ -1877,6 +2108,62 @@ const char* _glfwGetClipboardStringCocoa(void)
     _glfw.ns.clipboardString = _glfw_strdup([object UTF8String]);
 
     return _glfw.ns.clipboardString;
+
+    } // autoreleasepool
+}
+
+void _glfwUpdatePreeditCursorRectangleCocoa(_GLFWwindow* window)
+{
+    // Do nothing. Instead, implement `firstRectForCharacterRange` callback
+    // to update the position.
+}
+
+void _glfwResetPreeditTextCocoa(_GLFWwindow* window)
+{
+    @autoreleasepool {
+
+    NSTextInputContext* context = [NSTextInputContext currentInputContext];
+    [context discardMarkedText];
+    [window->ns.view unmarkText];
+
+    } // autoreleasepool
+}
+
+void _glfwSetIMEStatusCocoa(_GLFWwindow* window, int enabled)
+{
+    @autoreleasepool {
+
+        [window->ns.view setImeEnabled:enabled];
+
+        _glfwInputIMEStatus(window);
+    }
+}
+
+int _glfwGetIMEStatusCocoa(_GLFWwindow* window)
+{
+    @autoreleasepool {
+
+    NSArray* asciiInputSources =
+        CFBridgingRelease(TISCreateASCIICapableInputSourceList());
+
+    TISInputSourceRef currentSource = TISCopyCurrentKeyboardInputSource();
+    NSString* currentSourceID =
+        (__bridge NSString *) TISGetInputSourceProperty(currentSource,
+                                                        kTISPropertyInputSourceID);
+    CFRelease(currentSource);
+
+    for (int i = 0; i < [asciiInputSources count]; i++)
+    {
+        TISInputSourceRef asciiSource =
+            (__bridge TISInputSourceRef) [asciiInputSources objectAtIndex:i];
+        NSString* asciiSourceID =
+            (__bridge NSString *) TISGetInputSourceProperty(asciiSource,
+                                                            kTISPropertyInputSourceID);
+        if ([asciiSourceID compare:currentSourceID] == NSOrderedSame)
+            return GLFW_FALSE;
+    }
+
+    return GLFW_TRUE;
 
     } // autoreleasepool
 }
